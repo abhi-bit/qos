@@ -1,73 +1,122 @@
 package qos
 
 import (
-	"log"
+	"context"
+	"math"
 	"net"
 	"sync"
-	"time"
+
+	"golang.org/x/time/rate"
 )
 
 const (
-	globalCap             = 1024 * 1024
-	connCap               = 1024 * 20
-	runningWindowInterval = 60
-	backOffIntervalInMS   = 100
+	globalCap       = 1024 * 1024
+	connCap         = 1024 * 20
+	burstMultiplier = 5
 )
 
 type Config struct {
-	globalBandwidthCap    uint64
-	connBandwidthCap      uint64
-	runningWindowInterval int64
-	backOffInterval       int64
+	GlobalBandwidthCap int
+	ConnBandwidthCap   int
 }
 
 type QOS struct {
-	globalBandwidthCounter   *Counter
+	globalBandwidthCounter   *rate.Limiter
 	config                   *Config
-	connBandwidthTrackingMap map[net.Conn]*Counter
+	connBandwidthTrackingMap map[net.Conn]*rate.Limiter
 	rw                       *sync.RWMutex
 }
 
 func WithDefaultConfig() *QOS {
 	return WithConfig(&Config{
-		globalBandwidthCap:    globalCap,
-		connBandwidthCap:      connCap,
-		runningWindowInterval: runningWindowInterval,
-		backOffInterval:       backOffIntervalInMS,
+		GlobalBandwidthCap: globalCap,
+		ConnBandwidthCap:   connCap,
 	})
 }
 
 func WithConfig(c *Config) *QOS {
-	if c.globalBandwidthCap <= 0 {
-		c.globalBandwidthCap = globalCap
+	if c.GlobalBandwidthCap <= 0 {
+		c.GlobalBandwidthCap = globalCap
 	}
 
-	if c.connBandwidthCap <= 0 {
-		c.connBandwidthCap = connCap
-	}
-
-	if c.runningWindowInterval <= 0 {
-		c.runningWindowInterval = runningWindowInterval
-	}
-
-	if c.backOffInterval <= 0 {
-		c.backOffInterval = backOffIntervalInMS
+	if c.ConnBandwidthCap <= 0 {
+		c.ConnBandwidthCap = connCap
 	}
 
 	return &QOS{
-		globalBandwidthCounter:   NewCounter(c.runningWindowInterval),
+		globalBandwidthCounter: rate.NewLimiter(
+			rate.Limit(c.GlobalBandwidthCap),
+			c.GlobalBandwidthCap),
 		config:                   c,
-		connBandwidthTrackingMap: make(map[net.Conn]*Counter),
+		connBandwidthTrackingMap: make(map[net.Conn]*rate.Limiter),
 		rw:                       &sync.RWMutex{},
 	}
 }
 
-func (q *QOS) UpdateGlobalCap(cap uint64) {
-	q.config.globalBandwidthCap = cap
+func (q *QOS) UpdateGlobalCap(cap int) {
+	if cap == 0 {
+		q.config.GlobalBandwidthCap = math.MaxInt32
+	} else {
+		q.config.GlobalBandwidthCap = cap
+	}
+
+	q.globalBandwidthCounter = rate.NewLimiter(
+		rate.Limit(q.config.GlobalBandwidthCap),
+		q.config.GlobalBandwidthCap)
 }
 
-func (q *QOS) UpdateConnCap(cap uint64) {
-	q.config.connBandwidthCap = cap
+func (q *QOS) UpdateConnCap(cap int) {
+	if cap == 0 {
+		q.config.ConnBandwidthCap = math.MaxInt32
+	} else {
+		q.config.ConnBandwidthCap = cap
+	}
+
+	q.rw.Lock()
+	defer q.rw.Unlock()
+	for conn := range q.connBandwidthTrackingMap {
+		q.connBandwidthTrackingMap[conn] = rate.NewLimiter(
+			rate.Limit(q.config.ConnBandwidthCap),
+			q.config.ConnBandwidthCap*burstMultiplier)
+	}
+}
+
+type LimitedListener struct {
+	net.Listener
+	qs *QOS
+}
+
+type llConn struct {
+	net.Conn
+	qs *QOS
+}
+
+func (ll *LimitedListener) Accept() (net.Conn, error) {
+	c, err := ll.Listener.Accept()
+	ll.qs.TrackConn(c, 0)
+	return &llConn{
+		Conn: c,
+		qs:   ll.qs,
+	}, err
+}
+
+func (llc *llConn) Read(b []byte) (int, error) {
+	n, err := llc.Conn.Read(b)
+	llc.qs.TrackConn(llc, uint64(n))
+	return n, err
+}
+
+func (llc *llConn) Write(b []byte) (int, error) {
+	n, err := llc.Conn.Write(b)
+	llc.qs.TrackConn(llc, uint64(n))
+	return n, err
+}
+
+func (q *QOS) NewListener(l net.Listener) net.Listener {
+	return &LimitedListener{
+		Listener: l,
+		qs:       q,
+	}
 }
 
 func (q *QOS) TrackConn(conn net.Conn, bytesTx uint64) {
@@ -75,55 +124,16 @@ func (q *QOS) TrackConn(conn net.Conn, bytesTx uint64) {
 	defer q.rw.Unlock()
 
 	if _, ok := q.connBandwidthTrackingMap[conn]; !ok {
-		q.connBandwidthTrackingMap[conn] = NewCounter(q.config.runningWindowInterval)
+		q.connBandwidthTrackingMap[conn] = rate.NewLimiter(
+			rate.Limit(q.config.ConnBandwidthCap),
+			q.config.ConnBandwidthCap*burstMultiplier)
 	}
-	q.connBandwidthTrackingMap[conn].AddValue(bytesTx)
-	q.globalBandwidthCounter.AddValue(bytesTx)
+	q.globalBandwidthCounter.WaitN(context.Background(), int(bytesTx))
+	q.connBandwidthTrackingMap[conn].WaitN(context.Background(), int(bytesTx))
 }
 
 func (q *QOS) RemoveConn(conn net.Conn) {
 	q.rw.Lock()
 	defer q.rw.Unlock()
 	delete(q.connBandwidthTrackingMap, conn)
-}
-
-func (q *QOS) RateLimited(conn net.Conn) bool {
-	if q.globalBandwidthCounter.Sum() > q.config.globalBandwidthCap {
-		log.Printf("Throttling conn: %s Current global counter: %d cap: %d\n",
-			conn.RemoteAddr().String(), q.globalBandwidthCounter.Sum(), q.config.globalBandwidthCap)
-		return true
-	}
-
-	q.rw.RLock()
-	defer q.rw.RUnlock()
-
-	if connBandwidth, ok := q.connBandwidthTrackingMap[conn]; !ok {
-		return false
-	} else {
-		if connBandwidth.Sum() > q.config.connBandwidthCap {
-			log.Printf("Throttling conn: %s current conn counter: %d cap: %d\n",
-				conn.RemoteAddr().String(), connBandwidth.Sum(), q.config.connBandwidthCap)
-			return true
-		}
-	}
-
-	return false
-}
-
-func (q *QOS) Allowed(conn net.Conn) bool {
-	if !q.RateLimited(conn) {
-		return true
-	}
-
-	tick := time.NewTicker(time.Duration(q.config.backOffInterval) * time.Millisecond)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-tick.C:
-			if !q.RateLimited(conn) {
-				return true
-			}
-		}
-	}
 }
